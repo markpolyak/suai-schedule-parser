@@ -25,7 +25,12 @@ class Unit:
 
     name: str
     lessons: list[Lesson]
-    rooms: list[int] = field(default_factory=list)   # допустимые id аудиторий; пусто — любые
+    # допустимые id аудиторий; пусто — любые (~250 в справочнике).
+    # ВАЖНО: указывайте явный короткий список (через C.free_rooms/room_load_profile,
+    # отфильтрованные по корпусу и типу занятия) — иначе на каждой комбинации слотов
+    # search() будет проверять занятость всех аудиторий из справочника для каждой
+    # единицы, и при 3-4 единицах перебор может растянуться на минуты и дольше.
+    rooms: list[int] = field(default_factory=list)
     days: list[str] = field(default_factory=list)    # пусто — все рабочие дни
     slots: list[int] = field(default_factory=list)   # пусто — все пары
 
