@@ -25,6 +25,22 @@ NEARBY_CAMPUSES = {frozenset({"Ленсовета 14", "Гастелло 15"})}
 #: Аудитории, где одновременные занятия разных групп — норма.
 SHARED_ROOM_PATTERNS = ("спортзал", "бассейн", "манеж")
 
+#: Сколько переездов через весь город (с/на Б. Морскую — любой другой корпус
+#: не в NEARBY_CAMPUSES) за один день ещё приемлемо: 0 — весь день в одном
+#: корпусе, 1 — заехал и не возвращался. Начиная со следующего — запрет «два и
+#: более переезда за день» (независимо от того, соседние это пары или между
+#: ними есть окно — в отличие от _campus_hops, который ловит только впритык
+#: идущие пары). Переезды внутри NEARBY_CAMPUSES (Ленсовета ↔ Гастелло) в счёт
+#: не идут вообще — это в двух шагах друг от друга, а не «через весь город».
+MAX_DAILY_CAMPUS_HOPS = 1
+
+#: Минимальная длина окна (в парах) между двумя занятиями в один день, не
+#: объяснённого переездом между корпусами, которая считается запретом — но
+#: только для студенческих групп (см. _windows). У преподавателей окна
+#: проверке не подлежат: разные потоки одного предмета в разное время дня —
+#: обычная практика, а не проблема расписания.
+MIN_IDLE_WINDOW = 2
+
 _CAMPUS_RE = re.compile(r"\(([^()]*)\)\s*$")
 
 
@@ -193,6 +209,91 @@ def _campus_hops(lessons: list[Lesson], entity: str) -> list[Issue]:
     return out
 
 
+def _day_variants(day_lessons: list[Lesson]) -> list[tuple[int, list[Lesson]]]:
+    """Разбивает занятия одного дня на фактические варианты по чётности недели.
+
+    Если в дне нет занятий с конкретной чётностью — вариант один (WEEK_ANY).
+    Иначе — два варианта (нечётная/чётная неделя), каждый со своими
+    WEEK_ANY-занятиями и отсортированный по паре: так каждый вариант описывает
+    реальный день, который группа/преподаватель проживает в конкретную неделю.
+    """
+    if all(l.week == WEEK_ANY for l in day_lessons):
+        return [(WEEK_ANY, day_lessons)]
+    out = []
+    for week in (WEEK_ODD, WEEK_EVEN):
+        ls = sorted((l for l in day_lessons if l.week in (WEEK_ANY, week)),
+                    key=lambda l: l.slot)
+        if ls:
+            out.append((week, ls))
+    return out
+
+
+def _lesson_campus(l: Lesson) -> str | None:
+    return campus_of(l.room.name) if l.room and not is_pseudo_room(l.room) else None
+
+
+def _windows(lessons: list[Lesson], entity: str) -> list[Issue]:
+    """Окно ≥ MIN_IDLE_WINDOW пар между соседними занятиями за день, не
+    объяснённое переездом между корпусами (переезд разбирает `_campus_hops`/
+    `_multi_campus` — за него отдельно так не наказываем).
+
+    Вызывающая сторона применяет это только к студенческим группам —
+    у преподавателей окна между парами не запрещены."""
+    byday = defaultdict(list)
+    for l in lessons:
+        if l.in_grid:
+            byday[l.day].append(l)
+    out = []
+    for day, dls in byday.items():
+        for week, day_ls in _day_variants(sorted(dls, key=lambda l: l.slot)):
+            label = day if week == WEEK_ANY else f"{day}, {WEEK_NAMES[week]}"
+            for a, b in zip(day_ls, day_ls[1:]):
+                gap = b.slot - a.slot - 1
+                if gap < MIN_IDLE_WINDOW:
+                    continue
+                ca, cb = _lesson_campus(a), _lesson_campus(b)
+                if ca and cb and ca != cb:
+                    continue  # окно объясняется переездом между корпусами
+                out.append(Issue(
+                    "error", "window", entity, label,
+                    f"окно {gap} пар между «{a.subject}» ({LESSON_TIMES[a.slot][1]}) "
+                    f"и «{b.subject}» ({LESSON_TIMES[b.slot][0]})",
+                    [a, b]))
+    return out
+
+
+def _multi_campus(lessons: list[Lesson], entity: str) -> list[Issue]:
+    """Два и более переезда через весь город за один день — считаем все
+    посещённые за день корпуса подряд, а не только соседние пары.
+
+    Переходы внутри NEARBY_CAMPUSES (Ленсовета 14 ↔ Гастелло 15 — рядом, их
+    практикуют) переездом не считаются вообще, ни к счётчику, ни в качестве
+    самостоятельного нарушения: запрет — только про Б. Морскую и обратно.
+    """
+    byday = defaultdict(list)
+    for l in lessons:
+        if l.in_grid:
+            byday[l.day].append(l)
+    out = []
+    for day, dls in byday.items():
+        for week, day_ls in _day_variants(sorted(dls, key=lambda l: l.slot)):
+            label = day if week == WEEK_ANY else f"{day}, {WEEK_NAMES[week]}"
+            seq = []
+            for l in day_ls:
+                c = _lesson_campus(l)
+                if c and (not seq or seq[-1] != c):
+                    seq.append(c)
+            hops = sum(1 for a, b in zip(seq, seq[1:])
+                      if frozenset({a, b}) not in NEARBY_CAMPUSES)
+            if hops <= MAX_DAILY_CAMPUS_HOPS:
+                continue
+            out.append(Issue(
+                "error", "commute", entity, label,
+                f"{hops} переезда через город за день: " + " → ".join(seq),
+                day_ls))
+    return out
+
+
 def _capacity(lesson: Lesson, sch: Schedule) -> list[Issue]:
     if not lesson.in_grid or is_pseudo_room(lesson.room):
         return []
@@ -209,7 +310,8 @@ def _capacity(lesson: Lesson, sch: Schedule) -> list[Issue]:
 # валидация всего расписания
 # --------------------------------------------------------------------------
 
-def validate(sch: Schedule, check_campus: bool = True, check_capacity: bool = True) -> list[Issue]:
+def validate(sch: Schedule, check_campus: bool = True, check_capacity: bool = True,
+            check_windows: bool = True) -> list[Issue]:
     """Полная проверка расписания (в исходных данных ГУАП конфликтов почти нет —
     служит sanity-check'ом парсера и базой для сравнения «до/после»)."""
     issues: list[Issue] = []
@@ -224,8 +326,15 @@ def validate(sch: Schedule, check_campus: bool = True, check_capacity: bool = Tr
     if check_campus:
         for gid, ls in sch.by_group.items():
             issues += _campus_hops(ls, sch.groups[gid])
+            issues += _multi_campus(ls, sch.groups[gid])
         for tid, ls in sch.by_teacher.items():
             issues += _campus_hops(ls, sch.teachers[tid])
+            issues += _multi_campus(ls, sch.teachers[tid])
+    if check_windows:
+        # только у студенческих групп — у преподавателей окно между парами
+        # не считается запретом (см. _windows).
+        for gid, ls in sch.by_group.items():
+            issues += _windows(ls, sch.groups[gid])
     if check_capacity:
         for l in sch.lessons:
             issues += _capacity(l, sch)
@@ -237,7 +346,8 @@ def validate(sch: Schedule, check_campus: bool = True, check_capacity: bool = Tr
 # --------------------------------------------------------------------------
 
 def check_hypothesis(sch: Schedule, moves: list[Move], check_campus: bool = True,
-                     check_capacity: bool = True) -> tuple[list[Issue], list[Issue]]:
+                     check_capacity: bool = True, check_windows: bool = True
+                     ) -> tuple[list[Issue], list[Issue]]:
     """Возвращает (появившиеся проблемы, исчезнувшие проблемы) для набора переносов."""
     applied = {mv.lesson.uid: mv.applied() for mv in moves}
 
@@ -276,6 +386,9 @@ def check_hypothesis(sch: Schedule, moves: list[Move], check_campus: bool = True
         if check_campus:
             before += _campus_hops(base, name)
             after += _campus_hops(new, name)
+            before += _multi_campus(base, name)
+            after += _multi_campus(new, name)
+        # окна (_windows) у преподавателей не проверяем — см. validate()
 
     for gid in groups:
         base = sch.by_group.get(gid, [])
@@ -286,6 +399,11 @@ def check_hypothesis(sch: Schedule, moves: list[Move], check_campus: bool = True
         if check_campus:
             before += _campus_hops(base, name)
             after += _campus_hops(new, name)
+            before += _multi_campus(base, name)
+            after += _multi_campus(new, name)
+        if check_windows:
+            before += _windows(base, name)
+            after += _windows(new, name)
 
     if check_capacity:
         for uid, new in applied.items():
@@ -382,11 +500,14 @@ def candidate_slots(sch: Schedule, lesson: Lesson, days: list[str] | None = None
         if (day, slot, week) == (lesson.day, lesson.slot, lesson.week):
             continue
 
-        # 1. люди: конфликты групп и преподавателей не зависят от выбора аудитории
+        # 1. люди, переезды и окна: считаем на текущей аудитории занятия — при
+        # same_campus=True (по умолчанию) альтернативные аудитории того же
+        # корпуса ничего здесь не меняют, а смена корпуса ниже не предлагается.
+        # Ошибки категории "room" сюда не относим — их разбирает подбор аудиторий.
         probe = Move(lesson, day=day, slot=slot, week=week)
         added, removed = check_hypothesis(sch, [probe])
-        people_errors = [i for i in added if i.severity == "error" and i.kind in ("group", "teacher")]
-        if people_errors:
+        hard_errors = [i for i in added if i.severity == "error" and i.kind != "room"]
+        if hard_errors:
             continue
 
         # 2. аудитории
